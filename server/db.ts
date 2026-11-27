@@ -4,6 +4,8 @@
 // its jury guidance, its researchers, its autopilot pace. Templates only seed
 // a new board's flow; editing a board never changes another board.
 import { DatabaseSync } from 'node:sqlite';
+import { validModel } from './copilot.ts';
+import type { DocumentIdea } from './llm.ts';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS templates (
@@ -81,14 +83,31 @@ CREATE TABLE IF NOT EXISTS reports (
   content TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
--- Spend ledger per board and local calendar day; the rate limiter reads it.
--- board_id 0 = spend that belongs to no board.
+-- Historical provider spend, preserved without converting dollars into requests.
 CREATE TABLE IF NOT EXISTS spend (
   board_id INTEGER NOT NULL,
   day TEXT NOT NULL,
   usd REAL NOT NULL DEFAULT 0,
   calls INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (board_id, day)
+);
+CREATE TABLE IF NOT EXISTS copilot_requests (
+  board_id INTEGER NOT NULL,
+  day TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (board_id, day)
+);
+CREATE TABLE IF NOT EXISTS app_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  content TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS document_imports (
+  board_id INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+  fingerprint TEXT NOT NULL,
+  parts TEXT NOT NULL,
+  idea_ids TEXT,
+  deduplicated INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (board_id, fingerprint)
 );
 `;
 
@@ -147,9 +166,9 @@ export type BoardConfig = {
   mode: 'manual' | 'auto';
   /** Seconds between autopilot steps (pace). */
   autopilotSeconds: number;
-  rate: { stepsPerHour: number; usdPerDay: number };
+  rate: { stepsPerHour: number; requestsPerDay: number };
   autoProjectOnGold: boolean;
-  /** Per-role model overrides ("provider:model"); empty = the app-wide setting. */
+  /** Per-role Copilot catalog IDs; empty = the app-wide setting. */
   models: Partial<Record<(typeof MODEL_ROLES)[number], string>>;
 };
 
@@ -162,7 +181,7 @@ export function defaultConfig(template = DEFAULT_TEMPLATES[0]): BoardConfig {
     lang: 'sv',
     mode: 'manual',
     autopilotSeconds: 10,
-    rate: { stepsPerHour: 60, usdPerDay: 1 },
+    rate: { stepsPerHour: 60, requestsPerDay: 100 },
     autoProjectOnGold: true,
     models: {},
   };
@@ -178,12 +197,12 @@ export function mergeConfig(base: BoardConfig, raw: any): BoardConfig {
   const rr = r.researchers?.research ?? {};
   const secs = Number(r.autopilotSeconds);
   const sph = Number(r.rate?.stepsPerHour);
-  const usd = Number(r.rate?.usdPerDay);
+  const requests = r.rate?.requestsPerDay;
   const models: BoardConfig['models'] = { ...base.models };
   for (const role of MODEL_ROLES) {
     if (typeof r.models?.[role] === 'string') {
       const v = r.models[role].trim().slice(0, 200);
-      if (v) models[role] = v;
+      if (validModel(v)) models[role] = v;
       else delete models[role];
     }
   }
@@ -207,7 +226,7 @@ export function mergeConfig(base: BoardConfig, raw: any): BoardConfig {
     autopilotSeconds: Number.isFinite(secs) ? Math.min(3600, Math.max(3, Math.round(secs))) : base.autopilotSeconds,
     rate: {
       stepsPerHour: Number.isFinite(sph) ? Math.min(3600, Math.max(1, Math.round(sph))) : base.rate.stepsPerHour,
-      usdPerDay: Number.isFinite(usd) ? Math.min(1000, Math.max(0, Math.round(usd * 100) / 100)) : base.rate.usdPerDay,
+      requestsPerDay: typeof requests === 'number' && Number.isFinite(requests) ? Math.min(100_000, Math.max(0, Math.floor(requests))) : base.rate.requestsPerDay,
     },
     autoProjectOnGold: b(r.autoProjectOnGold, base.autoProjectOnGold),
     models,
@@ -326,6 +345,12 @@ const leadFromRow = (r: any): Lead => ({
   fetchedAt: r.fetched_at,
 });
 
+type NewIdea = {
+  boardId: number; title: string; pitch: string; kind: Idea['kind']; sourceUrl?: string | null;
+  x: number; y: number; generation: number; originIdeaId?: number | null; originBoardId?: number | null;
+};
+type DocumentImport = { parts: (DocumentIdea[] | null)[]; ideaIds: number[] | null; deduplicated: number };
+
 export function openDb(file: string) {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA foreign_keys = ON;');
@@ -348,6 +373,18 @@ export function openDb(file: string) {
       throw e;
     }
   };
+
+  function insertIdeaRow(i: NewIdea, parentIds: number[] = []): Idea {
+    const { lastInsertRowid } = db.prepare(
+      `INSERT INTO ideas (board_id, title, pitch, kind, source_url, x, y, generation, origin_idea_id, origin_board_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(i.boardId, i.title, i.pitch, i.kind, i.sourceUrl ?? null, i.x, i.y, i.generation, i.originIdeaId ?? null, i.originBoardId ?? null);
+    const id = Number(lastInsertRowid);
+    const edge = db.prepare('INSERT OR IGNORE INTO edges (board_id, from_id, to_id) VALUES (?, ?, ?)');
+    for (const p of parentIds) edge.run(i.boardId, p, id);
+    repo.touchBoard(i.boardId);
+    return repo.getIdea(id)!;
+  }
 
   const repo = {
     close: () => db.close(),
@@ -415,25 +452,40 @@ export function openDb(file: string) {
       return r ? ideaFromRow(r) : null;
     },
     /** Insert an idea and the edges from its parents in one transaction. */
-    insertIdea(
-      i: {
-        boardId: number; title: string; pitch: string; kind: Idea['kind']; sourceUrl?: string | null;
-        x: number; y: number; generation: number; originIdeaId?: number | null; originBoardId?: number | null;
-      },
-      parentIds: number[] = [],
-    ): Idea {
+    insertIdea(i: NewIdea, parentIds: number[] = []): Idea {
+      return tx(() => insertIdeaRow(i, parentIds));
+    },
+    documentImport(boardId: number, fingerprint: string): DocumentImport | null {
+      const row = db.prepare('SELECT parts, idea_ids, deduplicated FROM document_imports WHERE board_id = ? AND fingerprint = ?').get(boardId, fingerprint);
+      return row ? {
+        parts: JSON.parse(String(row.parts)),
+        ideaIds: row.idea_ids === null ? null : JSON.parse(String(row.idea_ids)),
+        deduplicated: Number(row.deduplicated),
+      } : null;
+    },
+    startDocumentImport(boardId: number, fingerprint: string, count: number) {
+      db.prepare('INSERT OR IGNORE INTO document_imports (board_id, fingerprint, parts) VALUES (?, ?, ?)')
+        .run(boardId, fingerprint, JSON.stringify(Array.from({ length: count }, () => null)));
+      return repo.documentImport(boardId, fingerprint)!;
+    },
+    saveDocumentParts(boardId: number, fingerprint: string, parts: (DocumentIdea[] | null)[]) {
+      db.prepare('UPDATE document_imports SET parts = ? WHERE board_id = ? AND fingerprint = ? AND idea_ids IS NULL')
+        .run(JSON.stringify(parts), boardId, fingerprint);
+    },
+    discardDocumentImport(boardId: number, fingerprint: string) {
+      db.prepare('DELETE FROM document_imports WHERE board_id = ? AND fingerprint = ? AND idea_ids IS NULL').run(boardId, fingerprint);
+    },
+    /** Publish the whole batch and its retry receipt together, never a partial wall import. */
+    commitDocumentImport(boardId: number, fingerprint: string, drafts: NewIdea[], deduplicated: number) {
       return tx(() => {
-        const { lastInsertRowid } = db
-          .prepare(
-            `INSERT INTO ideas (board_id, title, pitch, kind, source_url, x, y, generation, origin_idea_id, origin_board_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(i.boardId, i.title, i.pitch, i.kind, i.sourceUrl ?? null, i.x, i.y, i.generation, i.originIdeaId ?? null, i.originBoardId ?? null);
-        const id = Number(lastInsertRowid);
-        const edge = db.prepare('INSERT OR IGNORE INTO edges (board_id, from_id, to_id) VALUES (?, ?, ?)');
-        for (const p of parentIds) edge.run(i.boardId, p, id);
-        repo.touchBoard(i.boardId);
-        return repo.getIdea(id)!;
+        const saved = repo.documentImport(boardId, fingerprint);
+        if (!saved) throw new Error('Document import is missing');
+        if (saved.ideaIds !== null) return { ideas: saved.ideaIds.map((id) => repo.getIdea(id)).filter((idea): idea is Idea => !!idea), reused: true, deduplicated: saved.deduplicated };
+        if (saved.parts.some((part) => part === null) || drafts.some((draft) => draft.boardId !== boardId)) throw new Error('Document import is incomplete');
+        const ideas = drafts.map((draft) => insertIdeaRow(draft));
+        db.prepare('UPDATE document_imports SET idea_ids = ?, deduplicated = ? WHERE board_id = ? AND fingerprint = ?')
+          .run(JSON.stringify(ideas.map((idea) => idea.id)), deduplicated, boardId, fingerprint);
+        return { ideas, reused: false, deduplicated };
       });
     },
     /** Is this original already a guest on that board? */
@@ -649,7 +701,7 @@ export function openDb(file: string) {
     // ---- report: insights, ideas and projects across all boards
     /**
      * Everything the report window shows for the last `days` days: totals,
-     * every Claude Code project, and per board its goal, summary, best ideas.
+     * every Copilot project, and per board its goal, summary, best ideas.
      */
     report(days = 30) {
       const since = `-${days} days`;
@@ -689,6 +741,8 @@ export function openDb(file: string) {
           medals,
           projects: projects.length,
           spentUsd: Math.round((spent?.usd ?? 0) * 10000) / 10000,
+          requests: (db.prepare('SELECT COALESCE(SUM(requests), 0) AS n FROM copilot_requests WHERE day >= ?')
+            .get(localDay(new Date(Date.now() - (days - 1) * 86_400_000))) as { n: number }).n,
         },
         projects,
         boards: boards.map((b) => {
@@ -708,7 +762,35 @@ export function openDb(file: string) {
       db.prepare('INSERT INTO reports (days, lang, content) VALUES (?, ?, ?)').run(days, lang, JSON.stringify(content));
     },
 
-    // ---- spend ledger (per board, per local day)
+    getAppSettings(): unknown {
+      const row = db.prepare('SELECT content FROM app_settings WHERE id = 1').get() as { content: string } | undefined;
+      return row ? JSON.parse(row.content) : null;
+    },
+    saveAppSettings(settings: object) {
+      db.prepare('INSERT INTO app_settings (id, content) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET content = excluded.content')
+        .run(JSON.stringify(settings));
+    },
+    requestsOn(boardId: number | null, day = localDay()): number {
+      const row = (boardId == null
+        ? db.prepare('SELECT SUM(requests) AS n FROM copilot_requests WHERE day = ?').get(day)
+        : db.prepare('SELECT requests AS n FROM copilot_requests WHERE board_id = ? AND day = ?').get(boardId, day)) as { n: number } | undefined;
+      return row?.n ?? 0;
+    },
+    /** Synchronous reservation before any async work, including failed attempts. */
+    reserveRequest(boardId: number, boardLimit: number, globalLimit: number, day = localDay()): 'board' | 'global' | null {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const total = (db.prepare('SELECT COALESCE(SUM(requests), 0) AS n FROM copilot_requests WHERE day = ?').get(day) as { n: number }).n;
+        const board = (db.prepare('SELECT requests AS n FROM copilot_requests WHERE board_id = ? AND day = ?').get(boardId, day) as { n: number } | undefined)?.n ?? 0;
+        if (total >= globalLimit) { db.exec('COMMIT'); return 'global'; }
+        if (board >= boardLimit) { db.exec('COMMIT'); return 'board'; }
+        db.prepare(`INSERT INTO copilot_requests (board_id, day, requests) VALUES (?, ?, 1)
+          ON CONFLICT(board_id, day) DO UPDATE SET requests = requests + 1`).run(boardId, day);
+        db.exec('COMMIT');
+        return null;
+      } catch (e) { db.exec('ROLLBACK'); throw e; }
+    },
+    // ---- historical spend ledger (per board, per local day)
     addSpend(boardId: number, usd: number, day = localDay()) {
       db.prepare(
         `INSERT INTO spend (board_id, day, usd, calls) VALUES (?, ?, ?, 1)
@@ -732,7 +814,7 @@ export function openDb(file: string) {
 
 export type Repo = ReturnType<typeof openDb>;
 
-/** YYYY-MM-DD in local time: budgets reset at local midnight. */
+/** YYYY-MM-DD in local time: request limits reset at local midnight. */
 export function localDay(d = new Date()) {
   return d.toLocaleDateString('sv-SE');
 }

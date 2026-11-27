@@ -4,17 +4,19 @@ import { api, follow } from './api.js';
 import { $, h, clear, toast, debounce } from './dom.js';
 import { t, getLang, setLang, applyI18n, errorText } from './i18n.js';
 import { Graph, KIND_COLORS } from './graph.js';
-import { loadSettings, saveSettings, pushSettings, ROLES, PROVIDER_IDS, providersInUse, DEFAULTS } from './settings.js';
+import { loadSettings, saveSettings, pushSettings, ROLES, DEFAULTS } from './settings.js';
 import { medal, scoreSum, fitness, CRITERIA } from './score.js';
 import { evolutionStats } from './evolve.js';
 import { openDashboard } from './dashboard.js';
 import { openReport } from './report.js';
+import { documentParts, DOCUMENT_MAX_CHARS } from './document.js';
 
 const MEDAL_ICON = ['–', '🥉', '🥈', '🥇'];
 const S = {
   boards: [], board: null, ideas: new Map(), edges: [], leads: [], spinoffs: [], judging: new Set(),
-  autopilot: { state: 'manual' }, spentToday: 0, selected: null, templates: [], providers: null,
+  autopilot: { state: 'manual' }, requestsToday: 0, selected: null, templates: [], usage: null,
   settings: loadSettings(), stopFollow: null, createAt: null, leadsTab: 'x', refreshing: {}, exhibit: false,
+  documentDrafts: new Map(), documentJob: null,
 };
 const fail = (e) => toast(errorText(e), 'error', 8000);
 /** Built-in template names are bilingual ("Uppfinnaren · Inventor"); show the half that matches the UI. */
@@ -88,7 +90,7 @@ async function openBoard(id) {
   S.spinoffs = data.spinoffs;
   S.judging = new Set(data.judging);
   S.autopilot = data.autopilot;
-  S.spentToday = data.spentToday;
+  S.requestsToday = data.requestsToday;
   S.selected = null;
   localStorage.setItem('ideagen.board', String(id));
   graph.setData(data.ideas, data.edges, data.judging);
@@ -100,9 +102,11 @@ function onEvent(e) {
   switch (e.type) {
     case 'hello':
       S.autopilot = e.autopilot;
+      S.usage = e;
       renderAutopilot();
-      // The server restarted and lost the settings it only keeps in memory: hand them over again.
-      if (!e.settingsReceived) pushSettings(S.settings).then((p) => (S.providers = p)).catch(fail);
+      renderLeads();
+      // Hand over browser preferences only when no server settings have been saved.
+      if (!e.settingsReceived) pushSettings(S.settings).then((p) => (S.usage = p)).catch(fail);
       break;
     case 'ideas':
       for (const idea of e.ideas) {
@@ -144,11 +148,20 @@ function onEvent(e) {
       S.leads = [...S.leads.filter((l) => l.source !== e.source), ...e.leads];
       renderLeads();
       break;
+    case 'usage':
+      S.requestsToday = e.requestsToday;
+      if (S.autopilot) S.autopilot.requestsToday = e.requestsToday;
+      if (S.usage) S.usage.requestsToday = e.globalRequestsToday;
+      renderAutopilot();
+      break;
+    case 'document_progress':
+      if (S.documentJob?.requestId === e.requestId) S.documentJob.progress(e);
+      break;
     case 'autopilot':
       S.autopilot = e.status;
-      if (e.status.spentToday != null) S.spentToday = e.status.spentToday;
+      if (e.status.requestsToday != null) S.requestsToday = e.status.requestsToday;
       renderAutopilot();
-      if (e.status.state === 'error' && e.status.code === 'no_key') toast(errorText(e.status), 'error', 8000);
+      if (e.status.state === 'error' && e.status.code === 'copilot_auth') toast(errorText(e.status), 'error', 8000);
       break;
     case 'project':
       toast(t('projectCreated', { p: e.path }), 'good', 9000);
@@ -189,6 +202,124 @@ async function seedFromBar(ev) {
     input.disabled = false;
     input.placeholder = t('seedPlaceholder');
     input.focus();
+  }
+}
+
+function documentDialog() {
+  if (!S.board) return;
+  const boardId = S.board.id;
+  let running = false;
+  const input = h('textarea', {
+    id: 'document-input', rows: 13, value: S.documentDrafts.get(boardId) ?? '',
+    placeholder: t('documentPlaceholder'), 'aria-describedby': 'document-help document-count',
+  });
+  const count = h('p', { id: 'document-count', class: 'document-count' });
+  const error = h('p', { class: 'document-error', role: 'alert', hidden: true });
+  const status = h('p', { role: 'status', class: 'document-status', hidden: true });
+  const progress = h('progress', { value: 0, max: 1, 'aria-label': t('documentProgressLabel') });
+  const progressText = h('p', { 'aria-live': 'polite', 'aria-atomic': 'true' });
+  const progressBox = h('div', { class: 'document-progress', hidden: true }, progress, progressText);
+  const results = h('ul', { class: 'document-results', hidden: true });
+  const close = h('button', { class: 'btn', value: 'cancel' }, t('close'));
+  const view = h('button', { class: 'btn primary', type: 'button', hidden: true, onclick: () => { dlg.close(); graph.fit(); } }, t('documentViewWall'));
+  const mine = h('button', { class: 'btn primary', type: 'button', onclick: run }, t('mineDocument'));
+  const dlg = dialog('dlg', t('documentTitle'), [
+    h('p', { class: 'document-intro' }, t('documentIntro')),
+    field(t('documentLabel'), input),
+    count,
+    h('p', { id: 'document-help', class: 'document-help' }, t('documentHelp')),
+    progressBox, error, status, results,
+  ], [close, mine, view]);
+  dlg.setAttribute('aria-label', t('documentTitle'));
+  const preventClose = (event) => { if (running) event.preventDefault(); };
+  dlg.addEventListener('cancel', preventClose);
+  dlg.addEventListener('submit', preventClose);
+  dlg.addEventListener('close', () => {
+    dlg.removeAttribute('aria-label');
+    dlg.removeEventListener('cancel', preventClose);
+    dlg.removeEventListener('submit', preventClose);
+  }, { once: true });
+  input.addEventListener('input', () => {
+    S.documentDrafts.set(boardId, input.value);
+    error.hidden = true;
+    status.hidden = true;
+    results.hidden = true;
+    progressBox.hidden = true;
+    mine.hidden = false;
+    view.hidden = true;
+    updateCount();
+  });
+  updateCount();
+  input.focus();
+
+  function updateCount() {
+    const length = input.value.length;
+    const limit = DOCUMENT_MAX_CHARS.toLocaleString(getLang());
+    const oversized = length > DOCUMENT_MAX_CHARS;
+    const parts = !oversized && input.value.trim() ? documentParts(input.value).length : 0;
+    count.textContent = t(oversized ? 'documentOversized' : parts ? 'documentCount' : 'documentEmptyCount', {
+      n: length.toLocaleString(getLang()), limit, parts,
+    });
+    count.classList.toggle('document-error', oversized);
+    mine.disabled = running || oversized || !parts;
+    input.setAttribute('aria-invalid', String(oversized));
+  }
+
+  async function run() {
+    if (running || mine.disabled) return;
+    running = true;
+    input.disabled = true;
+    close.disabled = true;
+    $('header button', dlg).disabled = true;
+    mine.textContent = t('documentMining');
+    updateCount();
+    error.hidden = true;
+    status.hidden = true;
+    progressBox.hidden = false;
+    progress.max = documentParts(input.value).length;
+    progress.value = 0;
+    progressText.textContent = t('documentStarting');
+    dlg.setAttribute('aria-busy', 'true');
+    S.documentJob = {
+      requestId: crypto.randomUUID(),
+      progress: (event) => {
+        progress.max = event.total;
+        progress.value = event.completed;
+        progressText.textContent = t('documentProgress', { done: event.completed, total: event.total, part: event.part });
+      },
+    };
+    try {
+      const result = await api('POST', `/api/boards/${boardId}/documents`, { text: input.value, requestId: S.documentJob.requestId });
+      if (S.board?.id === boardId) {
+        for (const idea of result.ideas) { S.ideas.set(idea.id, idea); graph.upsert(idea); }
+        renderPanel();
+      }
+      progress.value = progress.max;
+      progressText.textContent = t('documentComplete', { parts: result.parts });
+      status.textContent = t(result.reused ? 'documentReused' : 'documentAdded', { n: result.ideas.length, d: result.deduplicated });
+      if (!result.reused && result.judgingQueued < result.ideas.length) {
+        status.textContent += ' ' + t('documentAwaitingJudge', { n: result.ideas.length - result.judgingQueued });
+      }
+      status.hidden = false;
+      clear(results, result.ideas.map((idea) => h('li', {}, idea.title)));
+      results.hidden = !result.ideas.length;
+      mine.hidden = true;
+      view.hidden = false;
+      view.focus();
+    } catch (e) {
+      error.textContent = `${errorText(e)} ${t('documentRetryHint')}`;
+      error.hidden = false;
+      progressBox.hidden = true;
+    } finally {
+      running = false;
+      S.documentJob = null;
+      input.disabled = false;
+      close.disabled = false;
+      $('header button', dlg).disabled = false;
+      mine.textContent = t('mineDocument');
+      dlg.removeAttribute('aria-busy');
+      updateCount();
+    }
   }
 }
 
@@ -270,6 +401,7 @@ async function patchBoard(patch) {
 
 function renderHeader() {
   const b = S.board;
+  $('#mine-document-btn').disabled = !b;
   if (!b) return;
   $('#board-title').value = b.title;
   $('#board-goal').value = b.goal;
@@ -302,8 +434,8 @@ function renderAutopilot() {
   const time = st.until ? new Date(st.until).toLocaleTimeString(getLang() === 'sv' ? 'sv-SE' : 'en-GB', { hour: '2-digit', minute: '2-digit' }) : '';
   const key = st.state === 'idle' ? (st.last === 'empty' ? 'ap_idle_empty' : st.last === 'nothing_to_do' ? 'ap_idle_nothing' : 'ap_idle') : `ap_${st.state}`;
   chip.textContent = t(key, { s: `${secs} s`, time, m: st.message ?? '' });
-  chip.title = t('apMeta', { n: st.stepsLastHour ?? 0, usd: (st.spentToday ?? S.spentToday ?? 0).toFixed(3) });
-  chip.className = `ap-chip ${['error', 'backoff', 'board_budget', 'global_budget', 'hourly'].includes(st.state) ? 'warn' : st.state === 'running' ? 'busy' : ''}`;
+  chip.title = t('apMeta', { n: st.stepsLastHour ?? 0, requests: st.requestsToday ?? S.requestsToday ?? 0 });
+  chip.className = `ap-chip ${['error', 'backoff', 'board_requests', 'global_requests', 'hourly'].includes(st.state) ? 'warn' : st.state === 'running' ? 'busy' : ''}`;
   $('#ex-status').textContent = chip.textContent;
 }
 setInterval(() => S.autopilot?.until && renderAutopilot(), 1000);
@@ -378,7 +510,7 @@ function scoreBlock(idea) {
 function renderIdea(idea) {
   const panel = $('#panel');
   const spun = S.spinoffs.filter((s) => s.ideaId === idea.id);
-  const startCmd = idea.projectPath ? `cd "${idea.projectPath}" && claude` : '';
+  const startCmd = idea.projectPath ? `cd "${idea.projectPath}" && copilot` : '';
   const medalBtn = (value, label) =>
     h('button', {
       class: `seg ${idea.medalOverride === value ? 'on' : ''}`,
@@ -539,6 +671,11 @@ async function summarize(btn) {
 
 // ================================================================ leads panel
 
+function xSearchSetupText() {
+  const configured = S.usage?.sources?.x?.configured;
+  return t(configured === true ? 'xSearchConfigured' : configured === false ? 'xSearchSetup' : 'xSearchUnknown');
+}
+
 function renderLeads() {
   const root = $('#leads-panel');
   if (!S.board || root.hidden) return;
@@ -549,6 +686,9 @@ function renderLeads() {
   const tab = (id, label) => h('button', { class: `tab ${src === id ? 'on' : ''}`, role: 'tab', 'aria-selected': String(src === id), onclick: () => { S.leadsTab = id; renderLeads(); } }, label);
   clear(root,
     h('div', { class: 'tabs', role: 'tablist' }, tab('x', t('leadsX')), tab('research', t('leadsResearch'))),
+    src === 'x' ? h('p', { class: 'muted small' }, t('xSearchNote')) : null,
+    src === 'x' ? h('p', { class: 'small', role: 'status' }, xSearchSetupText()) : null,
+    src === 'x' ? h('p', { class: 'muted small' }, t('xSearchCosts')) : null,
     !cfg.enabled
       ? h('p', { class: 'muted' }, t('researcherOff'))
       : [
@@ -564,11 +704,15 @@ function renderLeads() {
               ondragstart: (e) => { e.dataTransfer.setData('text/x-lead', String(l.id)); e.dataTransfer.effectAllowed = 'copy'; },
             },
               h('h4', {}, l.title),
+              src === 'x' ? h('p', { class: 'muted small', title: l.meta?.searchQuery ?? '' },
+                l.meta?.discovery === 'brave'
+                  ? t('xEvidence', { date: String(l.meta.retrievedAt ?? '').slice(0, 10) })
+                  : t('xLegacyEvidence')) : null,
               l.summary ? h('p', {}, l.summary) : null,
               l.hook ? h('p', { class: 'hook' }, `→ ${l.hook}`) : null,
               h('div', { class: 'row space' },
                 l.url ? h('a', { href: l.url, target: '_blank', rel: 'noopener noreferrer', class: 'small' },
-                  src === 'x' ? 'x.com ↗' : `${l.meta?.published ?? ''} ↗`) : h('span'),
+                  src === 'x' ? `${t('source')} ↗` : `${l.meta?.published ?? ''} ↗`) : h('span'),
                 l.ideaId ? h('span', { class: 'muted small' }, `✓ ${t('onBoard')}`) : h('button', { class: 'btn small', onclick: () => seedLead(l.id) }, t('addAsSeed')),
               ),
             ),
@@ -639,7 +783,7 @@ async function boardSettingsDialog() {
   const mode = h('select', {}, h('option', { value: 'manual', selected: c.mode === 'manual' }, t('manual')), h('option', { value: 'auto', selected: c.mode === 'auto' }, t('auto')));
   const pace = inp(c.autopilotSeconds, { type: 'number', min: 3, max: 3600 });
   const sph = inp(c.rate.stepsPerHour, { type: 'number', min: 1, max: 3600 });
-  const usd = inp(c.rate.usdPerDay, { type: 'number', min: 0, step: 0.1 });
+  const requests = inp(c.rate.requestsPerDay, { type: 'number', min: 0, step: 1 });
   const models = Object.fromEntries(ROLES.map((r) => [r, inp(c.models?.[r] ?? '', { placeholder: S.settings.models[r], list: 'model-list' })]));
 
   const dlg = dialog('dlg', t('boardSettings'), [
@@ -671,7 +815,7 @@ async function boardSettingsDialog() {
       h('label', { class: 'check' }, xOn, t('xScout')), field(t('focus'), xFocus),
       h('label', { class: 'check' }, rOn, t('researchScout')), field(t('focus'), rFocus)),
     h('fieldset', {}, h('legend', {}, t('autopilot')),
-      field(t('mode'), mode), h('div', { class: 'grid3' }, field(t('pace'), pace), field(t('stepsPerHour'), sph), field(t('usdPerDay'), usd)),
+      field(t('mode'), mode), h('div', { class: 'grid3' }, field(t('pace'), pace), field(t('stepsPerHour'), sph), field(t('requestsPerDay'), requests)),
       h('small', { class: 'muted' }, t('rateNote'))),
     h('fieldset', {}, h('legend', {}, t('models')), h('small', { class: 'muted' }, t('modelsBoardNote')),
       h('div', { class: 'grid2' }, ROLES.map((r) => field(t(`role_${r}`), models[r])))),
@@ -700,7 +844,7 @@ async function boardSettingsDialog() {
             lang: lang.value, flowName: flowName.value, flow: { system: sys.value, expand: exp.value, combine: comb.value },
             judgeGuidance: guidance.value, autoProjectOnGold: autoProj.checked,
             researchers: { x: { enabled: xOn.checked, focus: xFocus.value }, research: { enabled: rOn.checked, focus: rFocus.value } },
-            mode: mode.value, autopilotSeconds: Number(pace.value), rate: { stepsPerHour: Number(sph.value), usdPerDay: Number(usd.value) },
+            mode: mode.value, autopilotSeconds: Number(pace.value), rate: { stepsPerHour: Number(sph.value), requestsPerDay: Number(requests.value) },
             models: Object.fromEntries(ROLES.map((r) => [r, models[r].value])),
           },
         });
@@ -710,80 +854,66 @@ async function boardSettingsDialog() {
   ]);
 }
 
-const PROVIDER_LABELS = {
-  openrouter: 'OpenRouter', anthropic: 'Anthropic', openai: 'OpenAI',
-  azure: 'Azure OpenAI / Microsoft Foundry (Copilot models)', ollama: 'Ollama', mlx: 'MLX (mlx_lm.server)', lmstudio: 'LM Studio', custom: 'OpenAI-compatible',
-};
-const HAS_URL = ['ollama', 'mlx', 'lmstudio', 'azure', 'custom'];
-const HAS_KEY = ['openrouter', 'anthropic', 'openai', 'azure', 'custom'];
-const modelCatalog = new Map();
+let modelCatalog = [];
 
 function refreshModelList() {
   const dl = $('#model-list');
-  clear(dl, [...modelCatalog.entries()].flatMap(([p, ids]) => ids.slice(0, 400).map((id) => h('option', { value: `${p}:${id}` }))));
+  clear(dl, modelCatalog.map((id) => h('option', { value: id })));
 }
 
 function appSettingsDialog() {
   const s = structuredClone(S.settings);
-  const status = new Map((S.providers?.providers ?? []).map((p) => [p.id, p]));
-  const keys = {}, urls = {};
-  const rows = PROVIDER_IDS.map((p) => {
-    const st = status.get(p);
-    const result = h('span', { class: 'small muted' });
-    keys[p] = HAS_KEY.includes(p) ? h('input', { type: 'password', value: s.keys[p] ?? '', placeholder: t('apiKey'), autocomplete: 'off' }) : null;
-    urls[p] = HAS_URL.includes(p) ? h('input', { value: s.baseUrls[p] ?? '', placeholder: t('baseUrl') }) : null;
-    return h('div', { class: 'provider' },
-      h('div', { class: 'row space' },
-        h('strong', {}, PROVIDER_LABELS[p]),
-        h('span', { class: `badge ${st?.keySource ? 'ok' : st?.local ? '' : 'warn'}` },
-          st?.local ? t('local') : st?.keySource ? t(`keyFrom_${st.keySource}`) : t('keyMissing')),
-      ),
-      st?.note ? h('small', { class: 'muted' }, st.note) : null,
-      h('div', { class: 'row' }, keys[p], urls[p],
-        h('button', {
-          class: 'btn small', type: 'button',
-          onclick: async () => {
-            result.textContent = '…';
-            try {
-              await saveFromForm(false);
-              const { models } = await api('POST', `/api/providers/${p}/models`, {});
-              modelCatalog.set(p, models);
-              refreshModelList();
-              result.textContent = t('testOk', { n: models.length });
-            } catch (e) { result.textContent = errorText(e); }
-          },
-        }, t('test')), result),
-    );
-  });
+  const connection = h('p', { class: 'small muted', role: 'status', 'aria-live': 'polite' }, t('loginHint'));
+  const xStatus = h('p', { class: 'small', role: 'status', 'aria-live': 'polite' }, xSearchSetupText());
+  async function checkConnection() {
+    connection.textContent = t('thinking');
+    try {
+      const status = await api('GET', '/api/copilot/status');
+      S.usage = status;
+      xStatus.textContent = xSearchSetupText();
+      renderLeads();
+      if (!status.auth.isAuthenticated) {
+        connection.textContent = t('loginHint');
+        return;
+      }
+      const { models } = await api('GET', '/api/copilot/models');
+      modelCatalog = models;
+      refreshModelList();
+      connection.textContent = t('signedIn', { user: status.auth.login || 'GitHub', n: models.length, source: status.auth.authType || '' });
+    } catch (e) { connection.textContent = errorText(e); }
+  }
   const models = Object.fromEntries(ROLES.map((r) => [r, h('input', { value: s.models[r], list: 'model-list', placeholder: DEFAULTS.models[r] })]));
   const root = h('input', { value: s.projectsRoot });
-  const budget = h('input', { type: 'number', min: 0, step: 0.5, value: s.maxUsdPerDay });
-  const spend = S.providers ? t('spend', { today: S.providers.spentToday.toFixed(3), total: S.providers.spentTotal.usd.toFixed(3) }) : '';
+  const budget = h('input', { type: 'number', min: 0, step: 1, value: s.maxRequestsPerDay });
+  const spend = S.usage ? t('usage', { today: S.usage.requestsToday, total: S.usage.historicalSpend.usd.toFixed(3) }) : '';
 
   async function saveFromForm(close = true) {
-    for (const p of PROVIDER_IDS) {
-      if (keys[p]) { if (keys[p].value.trim()) s.keys[p] = keys[p].value.trim(); else delete s.keys[p]; }
-      if (urls[p]) s.baseUrls[p] = urls[p].value.trim();
-    }
     for (const r of ROLES) s.models[r] = models[r].value.trim() || DEFAULTS.models[r];
     s.projectsRoot = root.value.trim() || DEFAULTS.projectsRoot;
-    s.maxUsdPerDay = Number(budget.value);
+    s.maxRequestsPerDay = Number(budget.value);
+    S.usage = await saveSettings(s);
     S.settings = s;
-    S.providers = await saveSettings(s);
-    if (close) { dlg.close(); toast(t('settingsSaved')); warnMissingKeys(); }
+    if (close) { dlg.close(); toast(t('settingsSaved')); }
   }
 
   const dlg = dialog('dlg', t('appSettings'), [
     h('p', { class: 'small muted' }, t('settingsNote')),
-    h('fieldset', {}, h('legend', {}, t('providers')), rows),
+    h('fieldset', {}, h('legend', {}, 'GitHub Copilot'),
+      h('p', {}, t('loginHint')), h('pre', {}, h('code', {}, 'copilot login')),
+      h('small', { class: 'muted' }, t('authPersistence')),
+      h('button', { class: 'btn small', type: 'button', onclick: checkConnection }, t('checkConnection')), connection),
     h('fieldset', {}, h('legend', {}, t('models')), h('div', { class: 'grid2' }, ROLES.map((r) => field(t(`role_${r}`), models[r]))),
       h('small', { class: 'muted' }, t('calibrateNote'))),
-    h('fieldset', {}, h('legend', {}, 'Claude Code'), field(t('projectsRoot'), root)),
-    h('fieldset', {}, h('legend', {}, t('autopilot')), field(t('globalBudget'), budget, spend)),
+    h('fieldset', {}, h('legend', {}, 'GitHub Copilot CLI'), field(t('projectsRoot'), root)),
+    h('fieldset', {}, h('legend', {}, t('xScout')),
+      xStatus, h('p', { class: 'small muted' }, t('xSearchNote')), h('p', { class: 'small muted' }, t('xSearchCosts'))),
+    h('fieldset', {}, h('legend', {}, t('autopilot')), field(t('globalBudget'), budget, spend),
+      h('small', { class: 'muted' }, t('rateNote'))),
   ], [
     h('button', { class: 'btn', value: 'cancel' }, t('cancel')),
     h('button', { class: 'btn primary', onclick: (e) => { e.preventDefault(); saveFromForm().catch(fail); } }, t('save')),
   ]);
+  checkConnection();
 }
 
 function announceDialog(idea) {
@@ -870,14 +1000,6 @@ async function exportBoard() {
   }
 }
 
-function warnMissingKeys() {
-  const status = new Map((S.providers?.providers ?? []).map((p) => [p.id, p]));
-  for (const p of providersInUse(S.settings)) {
-    const st = status.get(p);
-    if (st && !st.local && st.needsKey && !st.keySource) toast(t('needKey', { p: st.label }), 'error', 10000);
-  }
-}
-
 function renderAll() {
   applyI18n();
   renderHeader();
@@ -889,6 +1011,7 @@ function renderAll() {
 
 function wire() {
   $('#seedbar').addEventListener('submit', seedFromBar);
+  $('#mine-document-btn').addEventListener('click', documentDialog);
   $('#board-menu-btn').addEventListener('click', (e) => {
     e.stopPropagation();
     const menu = $('#board-menu');
@@ -935,8 +1058,9 @@ async function main() {
   wire();
   applyI18n();
   try {
-    S.providers = await pushSettings(S.settings);
-    warnMissingKeys();
+    const saved = await api('GET', '/api/runtime-settings');
+    if (saved.settingsReceived) S.settings = saved.settings;
+    S.usage = await pushSettings(S.settings);
   } catch (e) {
     fail(e);
   }

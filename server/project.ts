@@ -1,4 +1,4 @@
-// Turn an idea into a folder that Claude Code can start from: a CLAUDE.md
+// Turn an idea into a folder that GitHub Copilot can start from: an AGENTS.md
 // brief, a README with the start command, an idea.json, an Obsidian vault for
 // notes (gitignored) and an empty git repo. Never overwrites: a taken name
 // gets -2, -3 and so on.
@@ -84,7 +84,7 @@ export async function writeBrief(a: {
 }) {
   const sum = scoreSum(a.idea);
   const user = [
-    'Turn this idea into a kickoff brief for a coding agent (Claude Code) that will build it from an empty folder.',
+    'Turn this idea into a kickoff brief for GitHub Copilot CLI that will build it from an empty folder.',
     `The idea:\n${fmt(a.idea)}`,
     a.goal.trim() ? `The goal of the board it came from: ${a.goal.trim()}` : '',
     sum != null ? `Jury verdict: originality ${a.idea.originality}, feasibility ${a.idea.feasibility}, impact ${a.idea.impact} (of 5). ${a.idea.reason ?? ''}` : '',
@@ -100,8 +100,6 @@ export async function writeBrief(a: {
     user,
     schemaName: 'brief',
     schema: BRIEF_SCHEMA,
-    temperature: 0.5,
-    maxTokens: 2500,
   });
   const v = r.value ?? {};
   const arr = (x: unknown) => (Array.isArray(x) ? x.map((s) => String(s).trim()).filter(Boolean).slice(0, 8) : []);
@@ -118,7 +116,7 @@ export async function writeBrief(a: {
     openQuestions: arr(v.openQuestions),
     risks: arr(v.risks),
   };
-  return { brief, costUsd: r.costUsd };
+  return { brief };
 }
 
 const L = {
@@ -135,7 +133,7 @@ const L = {
       'Fråga innan något kostar pengar (betalda API:er) eller publiceras.',
       'Anteckningar och idéer hör hemma i `vault/` (Obsidian), som aldrig checkas in.',
     ],
-    start: 'Kom igång', then: 'Säg sedan: "Läs CLAUDE.md och föreslå en plan för första steget."',
+    start: 'Kom igång', then: 'Säg sedan: "Läs AGENTS.md och föreslå en plan för första steget."',
     vaultIntro: 'Arbetsanteckningar för projektet. Mappen är gitignorerad.',
   },
   en: {
@@ -151,13 +149,13 @@ const L = {
       'Ask before anything that costs money (paid APIs) or publishes anything.',
       'Notes and ideas belong in `vault/` (Obsidian), which is never committed.',
     ],
-    start: 'Getting started', then: 'Then say: "Read CLAUDE.md and propose a plan for the first step."',
+    start: 'Getting started', then: 'Then say: "Read AGENTS.md and propose a plan for the first step."',
     vaultIntro: 'Working notes for the project. This folder is gitignored.',
   },
 };
 const MEDAL = ['', ' 🥉', ' 🥈', ' 🥇'];
 
-export function renderClaudeMd(a: { brief: Brief; idea: IdeaLike; goal: string; lineage: IdeaLike[]; lang: Lang; date: string }) {
+export function renderAgentsMd(a: { brief: Brief; idea: IdeaLike; goal: string; lineage: IdeaLike[]; lang: Lang; date: string }) {
   const t = L[a.lang];
   const b = a.brief;
   const bullets = (xs: string[]) => xs.map((x) => `- ${x}`).join('\n');
@@ -216,10 +214,10 @@ export async function writeProject(a: {
   const t = L[a.lang];
   const date = new Date().toISOString().slice(0, 10);
 
-  await writeFile(join(dir, 'CLAUDE.md'), renderClaudeMd({ ...a, date }));
+  await writeFile(join(dir, 'AGENTS.md'), renderAgentsMd({ ...a, date }));
   await writeFile(
     join(dir, 'README.md'),
-    [`# ${a.brief.name}`, '', a.brief.oneLiner, '', `## ${t.start}`, '', '```bash', `cd "${dir}"`, 'claude', '```', '', t.then, ''].join('\n'),
+    [`# ${a.brief.name}`, '', a.brief.oneLiner, '', `## ${t.start}`, '', '```bash', `cd "${dir}"`, 'copilot', '```', '', t.then, ''].join('\n'),
   );
   await writeFile(
     join(dir, 'idea.json'),
@@ -232,7 +230,7 @@ export async function writeProject(a: {
     [`# ${a.brief.name}`, '', t.vaultIntro, '', `## ${t.idea}`, '', fmt(a.idea), '', `## ${t.questions}`, '', ...a.brief.openQuestions.map((q) => `- [ ] ${q}`), ''].join('\n'),
   );
   if (a.gitInit !== false) {
-    await new Promise<void>((done) => execFile('git', ['init', '-q', '-b', 'main'], { cwd: dir }, () => done()));
+    await new Promise<void>((done, reject) => execFile('git', ['init', '-q', '-b', 'main'], { cwd: dir }, (error) => error ? reject(error) : done()));
   }
   return dir;
 }

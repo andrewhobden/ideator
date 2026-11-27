@@ -4,15 +4,17 @@
 // is published on a per-board bus that the browser follows over SSE.
 
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import type { Repo, Idea, Board } from './db.ts';
 import { makeLLM } from './llm.ts';
 import { asUrl, fetchPage as realFetchPage } from './extract.ts';
-import { fetchPapers as realFetchPapers, researchLeads, xLeads } from './leads.ts';
+import { fetchPapers as realFetchPapers, fetchXSearchResults as realFetchXSearchResults, researchLeads, xLeads, XSearchError } from './leads.ts';
 import { writeBrief, writeProject } from './project.ts';
-import { ProviderError, type AppSettings, type ChatFn, type Role } from './providers.ts';
+import { CopilotError, type AppSettings, type ChatFn, type Role } from './copilot.ts';
 import { fitness, isJudged, medal, scoreSum } from '../public/js/score.js';
 import { nextMove } from '../public/js/evolve.js';
+import { documentParts, DOCUMENT_MAX_CHARS, distinctDocumentIdeas } from '../public/js/document.js';
 
 export class AppError extends Error {
   status: number;
@@ -69,6 +71,7 @@ type Deps = {
   settings: () => AppSettings;
   fetchPage?: typeof realFetchPage;
   fetchPapers?: typeof realFetchPapers;
+  fetchXSearchResults?: typeof realFetchXSearchResults;
   reveal?: (path: string) => void;
   gitInit?: boolean;
 };
@@ -81,6 +84,7 @@ export function createEngine(deps: Deps) {
   const llm = makeLLM(deps.chat);
   const bus = createBus();
   const judging = new Set<number>();
+  const documentJobs = new Set<string>();
 
   const mustBoard = (id: number) => {
     const b = repo.getBoard(id);
@@ -95,16 +99,18 @@ export function createEngine(deps: Deps) {
   const modelFor = (board: Board, role: Role) => board.config.models[role] || deps.settings().models[role];
   const titles = (boardId: number) => repo.listIdeas(boardId).map((i) => i.title);
   const emitIdeas = (boardId: number, ideas: Idea[]) => ideas.length && bus.emit(boardId, { type: 'ideas', ideas });
+  const requestLimitError = (scope: 'board' | 'global') => new AppError(429, `${scope}_requests`, `Daily ${scope} Copilot request limit reached. Increase the limit in Settings or wait until local midnight.`);
 
-  /** Every LLM call: spend lands on the board's ledger; failures become 502s that keep the provider's code. */
-  async function call<T extends { costUsd: number }>(boardId: number, fn: () => Promise<T>): Promise<T> {
+  /** Count each application AI attempt, not Copilot billing units or dollars. */
+  async function call<T>(boardId: number, fn: () => Promise<T>): Promise<T> {
+    const limit = repo.reserveRequest(boardId, boardId ? mustBoard(boardId).config.rate.requestsPerDay : Infinity, deps.settings().maxRequestsPerDay);
+    if (limit) throw requestLimitError(limit);
+    bus.emit(boardId, { type: 'usage', requestsToday: repo.requestsOn(boardId), globalRequestsToday: repo.requestsOn(null) });
     try {
-      const out = await fn();
-      repo.addSpend(boardId, out.costUsd);
-      return out;
+      return await fn();
     } catch (e: any) {
       if (e instanceof AppError) throw e;
-      throw new AppError(502, e instanceof ProviderError ? e.code : 'llm_failed', e?.message ?? String(e));
+      throw new AppError(502, e instanceof CopilotError ? e.code : 'llm_failed', e?.message ?? String(e));
     }
   }
 
@@ -145,7 +151,7 @@ export function createEngine(deps: Deps) {
       );
       repo.saveJudgement(idea.id, judgement);
       const out: { idea: Idea; project?: string; projectError?: string } = { idea: repo.setKeywords(idea.id, judgement.keywords)! };
-      // The judge itself turns gold into a Claude Code project, if the board allows it.
+      // The judge turns gold into a Copilot project, if the board allows it.
       if (board.config.autoProjectOnGold && medal(out.idea) === 3 && !out.idea.projectPath) {
         try {
           const p = await createProject(out.idea);
@@ -167,6 +173,11 @@ export function createEngine(deps: Deps) {
   const queue: number[] = [];
   let active = 0;
   let idleWaiters: (() => void)[] = [];
+  function notifyIdle() {
+    if (active || queue.length || documentJobs.size) return;
+    idleWaiters.forEach((f) => f());
+    idleWaiters = [];
+  }
   function pump() {
     while (active < 3 && queue.length) {
       const id = queue.shift()!;
@@ -179,10 +190,7 @@ export function createEngine(deps: Deps) {
         .finally(() => {
           active--;
           pump();
-          if (!active && !queue.length) {
-            idleWaiters.forEach((f) => f());
-            idleWaiters = [];
-          }
+          notifyIdle();
         });
     }
   }
@@ -190,8 +198,8 @@ export function createEngine(deps: Deps) {
     for (const id of ids) if (!judging.has(id) && !queue.includes(id)) queue.push(id);
     pump();
   }
-  /** Resolves when no judgement is queued or running (tests, shutdown). */
-  const idle = () => (active || queue.length ? new Promise<void>((r) => idleWaiters.push(r)) : Promise.resolve());
+  /** Includes document work even if its browser disconnected before shutdown. */
+  const idle = () => (active || queue.length || documentJobs.size ? new Promise<void>((r) => idleWaiters.push(r)) : Promise.resolve());
 
   // ---------------------------------------------------------------- creating ideas
 
@@ -241,6 +249,72 @@ export function createEngine(deps: Deps) {
     idle,
     queueJudge,
     modelFor,
+
+    async mineDocument(boardId: number, b: { text?: unknown; requestId?: unknown }) {
+      const board = mustBoard(boardId);
+      if (typeof b.text !== 'string' || !b.text.trim()) throw new AppError(400, 'document_empty', 'Paste a document first.');
+      if (b.text.length > DOCUMENT_MAX_CHARS) throw new AppError(413, 'document_too_large', `Documents are limited to ${DOCUMENT_MAX_CHARS.toLocaleString('en-US')} characters. Nothing was truncated.`);
+      const parts = documentParts(b.text);
+      const model = modelFor(board, 'distill');
+      const fingerprint = createHash('sha256').update(JSON.stringify({ version: 1, text: b.text, model, goal: board.goal, lang: board.config.lang })).digest('hex');
+      const job = `${boardId}:${fingerprint}`;
+      const requestId = typeof b.requestId === 'string' ? b.requestId.slice(0, 100) : '';
+      if (documentJobs.has(job)) throw new AppError(409, 'document_busy', 'This document is already being mined on this board. Wait for it to finish before retrying.');
+      documentJobs.add(job);
+      try {
+        const saved = repo.startDocumentImport(boardId, fingerprint, parts.length);
+        if (saved.ideaIds !== null) return {
+          ideas: saved.ideaIds.map((id) => repo.getIdea(id)).filter((idea): idea is Idea => !!idea),
+          reused: true, deduplicated: saved.deduplicated, parts: parts.length, judgingQueued: 0,
+        };
+        const remaining = saved.parts.filter((part) => part === null).length;
+        const allowances = [
+          ['global', deps.settings().maxRequestsPerDay - repo.requestsOn(null)],
+          ['board', board.config.rate.requestsPerDay - repo.requestsOn(board.id)],
+        ] as const;
+        for (const [scope, available] of allowances) {
+          if (remaining > Math.max(0, available)) throw new AppError(429, `${scope}_requests`,
+            `This document needs ${remaining} additional extraction requests, but only ${Math.max(0, available)} remain under the daily ${scope} limit. Increase the limit in Settings or wait until local midnight.`);
+        }
+        for (let index = 0; index < parts.length; index++) {
+          if (saved.parts[index] !== null) continue;
+          bus.emit(board.id, { type: 'document_progress', requestId, part: index + 1, total: parts.length, completed: saved.parts.filter((part) => part !== null).length });
+          const extracted = saved.parts.flatMap((part) => part ?? []);
+          const { ideas } = await call(board.id, () => llm.mineDocumentPart({
+            model, board, text: parts[index], before: parts[index - 1]?.slice(-500) ?? '', after: parts[index + 1]?.slice(0, 500) ?? '',
+            part: index + 1, total: parts.length, existingTitles: extracted.map((idea) => idea.title), lang: board.config.lang,
+          }));
+          saved.parts[index] = ideas;
+          repo.saveDocumentParts(board.id, fingerprint, saved.parts);
+          bus.emit(board.id, { type: 'document_progress', requestId, part: index + 1, total: parts.length, completed: saved.parts.filter((part) => part !== null).length });
+        }
+        const extracted = saved.parts.flatMap((part) => part ?? []);
+        if (!extracted.length) {
+          repo.discardDocumentImport(board.id, fingerprint);
+          throw new AppError(422, 'document_no_ideas', 'No concrete idea seeds were found in this document. Your text was kept; no seeds were added.');
+        }
+        const current = repo.listIdeas(board.id);
+        const novel = distinctDocumentIdeas(extracted, current);
+        const anchor = besideBoard(current);
+        const columns = Math.max(1, Math.ceil(Math.sqrt(novel.length)));
+        const rows = Math.ceil(novel.length / columns);
+        const result = repo.commitDocumentImport(board.id, fingerprint, novel.map((idea, index) => ({
+          boardId, title: idea.title, pitch: idea.pitch, kind: 'seed', generation: 0,
+          x: anchor.x + index % columns * 240, y: anchor.y + (Math.floor(index / columns) - (rows - 1) / 2) * 180,
+        })), extracted.length - novel.length);
+        emitIdeas(board.id, result.ideas);
+        const judgingQueued = result.reused ? 0 : Math.max(0, Math.min(
+          result.ideas.length,
+          deps.settings().maxRequestsPerDay - repo.requestsOn(null),
+          board.config.rate.requestsPerDay - repo.requestsOn(board.id),
+        ));
+        queueJudge(result.ideas.slice(0, judgingQueued).map((idea) => idea.id));
+        return { ...result, parts: parts.length, judgingQueued };
+      } finally {
+        documentJobs.delete(job);
+        notifyIdle();
+      }
+    },
 
     async seed(boardId: number, b: { text: string; x?: number; y?: number }) {
       const board = mustBoard(boardId);
@@ -407,7 +481,12 @@ export function createEngine(deps: Deps) {
       const topic = [board.goal, focus].filter(Boolean).join(' — ');
       let r: { leads: any[]; dropped?: number };
       if (source === 'x') {
-        r = await call(board.id, () => xLeads({ chat: deps.chat, model: modelFor(board, 'x'), goal: topic, lang }));
+        if (repo.requestsOn(null) >= deps.settings().maxRequestsPerDay) throw requestLimitError('global');
+        if (repo.requestsOn(board.id) >= board.config.rate.requestsPerDay) throw requestLimitError('board');
+        let results;
+        try { results = await (deps.fetchXSearchResults ?? realFetchXSearchResults)(topic); }
+        catch (e: any) { throw new AppError(e instanceof XSearchError && e.code === 'x_not_configured' ? 503 : 502, e instanceof XSearchError ? e.code : 'x_source_failed', e?.message ?? String(e)); }
+        r = results.length ? await call(board.id, () => xLeads({ chat: deps.chat, model: modelFor(board, 'x'), goal: topic, lang, results })) : { leads: [] };
       } else {
         let papers;
         try {
@@ -415,6 +494,7 @@ export function createEngine(deps: Deps) {
         } catch (e: any) {
           throw new AppError(502, 'research_failed', e?.message ?? String(e));
         }
+        if (!papers.length) throw new AppError(502, 'research_empty', 'Hugging Face returned no papers; saved leads were kept.');
         r = await call(board.id, () => researchLeads({ chat: deps.chat, model: modelFor(board, 'research'), goal: topic, lang, papers }));
       }
       // Nothing verified: keep the old leads rather than wiping the panel.

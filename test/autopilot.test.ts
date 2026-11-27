@@ -3,22 +3,21 @@ import assert from 'node:assert/strict';
 import { backoffMs, createAutopilot, nextLocalMidnight, rateCheck, type RateInput } from '../server/autopilot.ts';
 import { openDb } from '../server/db.ts';
 import { createBus, createEngine } from '../server/engine.ts';
-import { DEFAULT_APP_SETTINGS, type ChatRequest } from '../server/providers.ts';
+import { DEFAULT_APP_SETTINGS, type ChatRequest } from '../server/copilot.ts';
 
 const T = Date.parse('2026-11-02T12:00:00');
 const base: RateInput = {
-  now: T, steps: [], lastAt: 0, paceSeconds: 10, stepsPerHour: 60, boardSpent: 0, boardUsdPerDay: 1,
-  globalSpent: 0, globalUsdPerDay: 5, errors: 0, lastErrorAt: 0,
+  now: T, steps: [], lastAt: 0, paceSeconds: 10, stepsPerHour: 60, boardRequests: 0, boardRequestsPerDay: 10,
+  globalRequests: 0, globalRequestsPerDay: 50, errors: 0, lastErrorAt: 0,
 };
 
-test('rate limiter: budgets, backoff, hourly window, pace', () => {
+test('rate limiter: request limits, backoff, hourly window, pace', () => {
   assert.deepEqual(rateCheck(base), { ok: true });
-  assert.deepEqual(rateCheck({ ...base, globalSpent: 5 }), { ok: false, reason: 'global_budget', until: nextLocalMidnight(T) });
-  assert.equal((rateCheck({ ...base, boardSpent: 1.2 }) as any).reason, 'board_budget');
-  assert.equal((rateCheck({ ...base, boardSpent: 0.99 }) as any).ok, true);
-  // 0 = free models only: nothing spent keeps running, the first paid cent stops it
-  assert.equal(rateCheck({ ...base, boardUsdPerDay: 0, boardSpent: 0 }).ok, true);
-  assert.equal((rateCheck({ ...base, boardUsdPerDay: 0, boardSpent: 0.001 }) as any).reason, 'board_budget');
+  assert.deepEqual(rateCheck({ ...base, globalRequests: 50 }), { ok: false, reason: 'global_requests', until: nextLocalMidnight(T) });
+  assert.equal((rateCheck({ ...base, boardRequests: 10 }) as any).reason, 'board_requests');
+  assert.equal(rateCheck({ ...base, boardRequests: 9 }).ok, true);
+  assert.equal((rateCheck({ ...base, boardRequestsPerDay: 0 }) as any).reason, 'board_requests');
+  assert.equal((rateCheck({ ...base, globalRequestsPerDay: 0 }) as any).reason, 'global_requests');
 
   assert.deepEqual([1, 2, 3, 10].map(backoffMs), [30_000, 60_000, 120_000, 900_000]);
   assert.equal((rateCheck({ ...base, errors: 2, lastErrorAt: T - 30_000 }) as any).reason, 'backoff');
@@ -46,9 +45,9 @@ function fakeEngineFor(repo: ReturnType<typeof openDb>) {
     engine: {
       bus,
       async autoStep(boardId: number) {
-        if (fail) throw Object.assign(new Error('no key'), { code: 'no_key' });
+        if (fail) throw Object.assign(new Error('sign-in expired'), { code: 'copilot_auth' });
         steps.push(boardId);
-        repo.addSpend(boardId, 0.3);
+        repo.reserveRequest(boardId, 100, 500);
         return { did: 'combine' as const };
       },
     } as any,
@@ -60,7 +59,7 @@ test('scheduler: only auto boards run, at their pace, within their limits', asyn
   let now = T;
   const { engine, steps, setFail } = fakeEngineFor(repo);
   const ap = createAutopilot({ repo, engine, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
-  const auto = repo.createBoard({ title: 'Auto', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 3, usdPerDay: 100 } } });
+  const auto = repo.createBoard({ title: 'Auto', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 3, requestsPerDay: 100 } } });
   repo.createBoard({ title: 'Manual' });
   const flush = () => new Promise((r) => setTimeout(r, 5));
 
@@ -80,17 +79,17 @@ test('scheduler: only auto boards run, at their pace, within their limits', asyn
   now += 3_600_000; setFail(true);
   await ap.tick(); await flush();
   assert.equal(ap.status(auto.id).state, 'error');
-  assert.equal(ap.status(auto.id).code, 'no_key');
+  assert.equal(ap.status(auto.id).code, 'copilot_auth');
   now += 15_000; await ap.tick(); await flush();
   assert.equal(ap.status(auto.id).state, 'backoff');
   setFail(false);
   now += 30_000; await ap.tick(); await flush();
   assert.equal(steps.length, 4, 'recovers after the backoff');
 
-  // Budget: the board has spent 4 × $0.30; a $1 cap stops it until midnight.
-  repo.updateBoard(auto.id, { config: { rate: { stepsPerHour: 3, usdPerDay: 1 } } });
+  // Four requests have been reserved; lowering the cap stops it until midnight.
+  repo.updateBoard(auto.id, { config: { rate: { stepsPerHour: 3, requestsPerDay: 4 } } });
   now += 20_000; await ap.tick(); await flush();
-  assert.equal(ap.status(auto.id).state, 'board_budget');
+  assert.equal(ap.status(auto.id).state, 'board_requests');
   assert.equal(steps.length, 4);
 
   repo.updateBoard(auto.id, { config: { mode: 'manual' } });
@@ -107,7 +106,7 @@ test('autoStep with the real engine: judge first, grow a small pool, then breed'
       r.schemaName === 'expand' ? { ideas: [1, 2, 3].map((k) => ({ title: `Idé ${n}.${k}`, pitch: 'p' })) }
       : r.schemaName === 'judgement' ? { reason: 'r', originality: 2 + (n % 3), feasibility: 3, impact: 3, keywords: ['k'] }
       : { title: `Korsning ${n}`, pitch: 'p' };
-    return { value, costUsd: 0 };
+    return { value };
   };
   const engine = createEngine({ repo, chat, settings: () => DEFAULT_APP_SETTINGS, gitInit: false });
   const board = repo.createBoard({ title: 'B' });

@@ -1,4 +1,4 @@
-// The report: insights, ideas and Claude Code projects across all boards,
+// The report: insights, ideas and Copilot projects across all boards,
 // for a chosen period. Conclusions are written on request (one LLM call) and
 // saved, so opening the report costs nothing.
 
@@ -31,7 +31,7 @@ async function load() {
   }
 }
 
-const startCmd = (path) => `cd "${path}" && claude`;
+const startCmd = (path) => `cd "${path}" && copilot`;
 
 function ideaLine(i, boardTitle) {
   return h('button', { class: 'rank-item', onclick: () => { close(); S.onOpenIdea?.(i.boardId, i.id); } },
@@ -59,6 +59,7 @@ function render(r) {
       tile(t('statIdeas'), `${r.totals.ideas}`, t('reportNew', { n: r.totals.newIdeas })),
       tile(t('reportMedals'), `🥇 ${m.gold}  🥈 ${m.silver}  🥉 ${m.bronze}`),
       tile(t('reportProjects'), `${r.totals.projects}`),
+      tile(t('reportRequests', { n: S.days }), `${r.totals.requests}`),
       tile(t('reportSpent', { n: S.days }), `$${r.totals.spentUsd.toFixed(2)}`),
     ),
 

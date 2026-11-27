@@ -8,17 +8,17 @@ import { extname, join, resolve, sep } from 'node:path';
 import type { Repo, Idea, Board } from './db.ts';
 import { AppError, type Engine } from './engine.ts';
 import type { Autopilot } from './autopilot.ts';
-import { PROVIDERS, keySource, listModels, mergeAppSettings, type AppSettings, type ProviderId } from './providers.ts';
+import { mergeAppSettings, validModel, ROLES, CopilotError, type AppSettings, type Copilot } from './copilot.ts';
 import { fitness, medal, scoreSum } from '../public/js/score.js';
 
 export type Runtime = {
   get(): AppSettings;
   set(s: AppSettings): void;
-  /** Has a browser pushed its settings since the server started? */
+  /** Are saved non-secret settings available? */
   received(): boolean;
 };
 
-type Deps = { repo: Repo; engine: Engine; autopilot: Autopilot; runtime: Runtime; publicDir: string };
+type Deps = { repo: Repo; engine: Engine; autopilot: Autopilot; runtime: Runtime; copilot: Pick<Copilot, 'status' | 'models'>; publicDir: string; xSearchConfigured?: () => boolean };
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -60,13 +60,13 @@ const LABELS = {
   sv: {
     flow: 'Flöde', ideas: 'idéer', exported: 'Exporterad', seed: 'Frö', source: 'Källa', parents: 'Föräldrar',
     originality: 'Originalitet', feasibility: 'Genomförbarhet', impact: 'Effekt', unjudged: 'Ej bedömd',
-    handset: 'satt för hand', guest: 'Gäst från tavlan', project: 'Claude Code-projekt',
+    handset: 'satt för hand', guest: 'Gäst från tavlan', project: 'Copilot-projekt',
     summary: 'Sammanfattning', strongest: 'Starkast', gaps: 'Luckor', next: 'Nästa steg', stale: 'Sammanfattningen är äldre än tavlan',
   },
   en: {
     flow: 'Flow', ideas: 'ideas', exported: 'Exported', seed: 'Seed', source: 'Source', parents: 'Parents',
     originality: 'Originality', feasibility: 'Feasibility', impact: 'Impact', unjudged: 'Not judged',
-    handset: 'set by hand', guest: 'Guest from board', project: 'Claude Code project',
+    handset: 'set by hand', guest: 'Guest from board', project: 'Copilot project',
     summary: 'Summary', strongest: 'Strongest', gaps: 'Gaps', next: 'Next steps', stale: 'The summary is older than the board',
   },
 };
@@ -120,14 +120,14 @@ export function boardMarkdown(board: Board, ideas: Idea[], edges: { from: number
 
 const REPORT_LABELS = {
   sv: {
-    title: 'Rapport', period: 'Senaste {n} dagarna', boards: 'tavlor', ideas: 'idéer', newIdeas: 'nya', projects: 'Claude Code-projekt',
-    spent: 'Förbrukat', conclusions: 'Slutsatser', insights: 'Insikter', standouts: 'Mest värt att driva vidare', opportunities: 'Möjligheter',
+    title: 'Rapport', period: 'Senaste {n} dagarna', boards: 'tavlor', ideas: 'idéer', newIdeas: 'nya', projects: 'Copilot-projekt',
+    spent: 'Historisk kostnad (före Copilot)', requests: 'Copilot-anrop', conclusions: 'Slutsatser', insights: 'Insikter', standouts: 'Mest värt att driva vidare', opportunities: 'Möjligheter',
     next: 'Nästa steg', goal: 'Mål', best: 'Bästa idéerna', summary: 'Sammanfattning', stale: 'äldre än tavlan', none: 'Inga ännu.',
     start: 'Starta',
   },
   en: {
-    title: 'Report', period: 'Last {n} days', boards: 'boards', ideas: 'ideas', newIdeas: 'new', projects: 'Claude Code projects',
-    spent: 'Spent', conclusions: 'Conclusions', insights: 'Insights', standouts: 'Most worth pursuing', opportunities: 'Opportunities',
+    title: 'Report', period: 'Last {n} days', boards: 'boards', ideas: 'ideas', newIdeas: 'new', projects: 'Copilot projects',
+    spent: 'Historical spend (pre-Copilot)', requests: 'Copilot requests', conclusions: 'Conclusions', insights: 'Insights', standouts: 'Most worth pursuing', opportunities: 'Opportunities',
     next: 'Next steps', goal: 'Goal', best: 'Best ideas', summary: 'Summary', stale: 'older than the board', none: 'None yet.',
     start: 'Start',
   },
@@ -138,7 +138,7 @@ export function reportMarkdown(r: ReturnType<Repo['report']>, lang: 'sv' | 'en')
   const m = r.totals.medals;
   const out = [
     `# ${L.title} · ${new Date().toISOString().slice(0, 10)}`, '',
-    `${L.period.replace('{n}', String(r.days))} · ${r.totals.boards} ${L.boards} · ${r.totals.ideas} ${L.ideas} (${r.totals.newIdeas} ${L.newIdeas}) · 🥇 ${m.gold} 🥈 ${m.silver} 🥉 ${m.bronze} · ${r.totals.projects} ${L.projects} · ${L.spent} $${r.totals.spentUsd.toFixed(2)}`, '',
+    `${L.period.replace('{n}', String(r.days))} · ${r.totals.boards} ${L.boards} · ${r.totals.ideas} ${L.ideas} (${r.totals.newIdeas} ${L.newIdeas}) · 🥇 ${m.gold} 🥈 ${m.silver} 🥉 ${m.bronze} · ${r.totals.projects} ${L.projects} · ${L.requests}: ${r.totals.requests} · ${L.spent} $${r.totals.spentUsd.toFixed(2)}`, '',
   ];
   const s = r.synthesis;
   if (s) {
@@ -150,7 +150,7 @@ export function reportMarkdown(r: ReturnType<Repo['report']>, lang: 'sv' | 'en')
   }
   out.push(`## ${L.projects}`, '');
   if (!r.projects.length) out.push(L.none, '');
-  for (const p of r.projects) out.push(`- **${p.title}** (${p.boardTitle}${p.sum != null ? `, ${p.sum}/15` : ''}): \`cd "${p.path}" && claude\``);
+  for (const p of r.projects) out.push(`- **${p.title}** (${p.boardTitle}${p.sum != null ? `, ${p.sum}/15` : ''}): \`cd "${p.path}" && copilot\``);
   out.push('');
   for (const b of r.boards) {
     out.push(`## ${b.title}`, '');
@@ -162,39 +162,35 @@ export function reportMarkdown(r: ReturnType<Repo['report']>, lang: 'sv' | 'en')
   return out.join('\n');
 }
 
-export function createHandler({ repo, engine, autopilot, runtime, publicDir }: Deps) {
+export function createHandler({ repo, engine, autopilot, runtime, copilot, publicDir, xSearchConfigured = () => !!process.env.BRAVE_SEARCH_API_KEY?.trim() }: Deps) {
   const root = resolve(publicDir);
+  const streams = new Set<ServerResponse>();
 
-  function providerStatus() {
-    const s = runtime.get();
+  function usageStatus() {
     return {
       settingsReceived: runtime.received(),
-      providers: (Object.keys(PROVIDERS) as ProviderId[]).map((id) => ({
-        id, label: PROVIDERS[id].label, local: !!PROVIDERS[id].local, needsKey: PROVIDERS[id].needsKey,
-        search: !!PROVIDERS[id].search, note: PROVIDERS[id].note ?? null, keySource: keySource(s, id),
-        baseUrl: s.baseUrls[id] ?? null,
-      })),
-      spentToday: repo.spentOn(null),
-      spentTotal: repo.spentTotal(),
+      requestsToday: repo.requestsOn(null),
+      historicalSpend: repo.spentTotal(),
+      sources: { x: { configured: xSearchConfigured() } },
     };
   }
 
   type Handler = (p: string[], body: any, url: URL) => Promise<unknown> | unknown;
   const routes: [string, RegExp, Handler][] = [
-    // ---- app settings: owned by the browser, held here in memory only
+    // ---- non-secret settings; authentication belongs exclusively to the CLI
     ['PUT', /^\/api\/runtime-settings$/, (_p, b) => {
-      runtime.set(mergeAppSettings(b));
-      return providerStatus();
-    }],
-    ['GET', /^\/api\/providers$/, () => providerStatus()],
-    ['POST', /^\/api\/providers\/([a-z]+)\/models$/, async ([id]) => {
-      if (!(id in PROVIDERS)) throw new AppError(404, 'not_found', 'Unknown provider');
-      try {
-        return { models: await listModels(runtime.get(), id as ProviderId) };
-      } catch (e: any) {
-        throw new AppError(502, e?.code ?? 'provider_error', e?.message ?? String(e));
+      if (b.maxRequestsPerDay !== undefined && (!Number.isInteger(b.maxRequestsPerDay) || b.maxRequestsPerDay < 0 || b.maxRequestsPerDay > 100_000)) {
+        throw new AppError(400, 'bad_limit', 'Daily Copilot request limit must be an integer from 0 to 100000.');
       }
+      for (const role of ROLES) if (b.models?.[role] !== undefined && !validModel(b.models[role])) {
+        throw new AppError(400, 'bad_model', 'Use a Copilot catalog model ID without a provider prefix.');
+      }
+      runtime.set(mergeAppSettings(b));
+      return usageStatus();
     }],
+    ['GET', /^\/api\/runtime-settings$/, () => ({ settings: runtime.get(), ...usageStatus() })],
+    ['GET', /^\/api\/copilot\/status$/, async () => ({ auth: await copilot.status(), ...usageStatus() })],
+    ['GET', /^\/api\/copilot\/models$/, async () => ({ models: await copilot.models() })],
 
     // ---- boards
     ['GET', /^\/api\/boards$/, () => ({ boards: repo.listBoards() })],
@@ -220,7 +216,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
         spinoffs: repo.spinoffs(board.id),
         judging: ideas.filter((i) => engine.judging.has(i.id)).map((i) => i.id),
         autopilot: autopilot.status(board.id),
-        spentToday: repo.spentOn(board.id),
+        requestsToday: repo.requestsOn(board.id),
       };
     }],
     ['PATCH', /^\/api\/boards\/(\d+)$/, ([id], b) => {
@@ -249,6 +245,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
 
     // ---- ideas
     ['POST', /^\/api\/boards\/(\d+)\/seed$/, ([id], b) => engine.seed(+id, b)],
+    ['POST', /^\/api\/boards\/(\d+)\/documents$/, ([id], b) => engine.mineDocument(+id, b)],
     ['POST', /^\/api\/ideas\/(\d+)\/expand$/, ([id]) => engine.expand(+id)],
     ['POST', /^\/api\/boards\/(\d+)\/combine$/, ([id], b) => engine.combine(+id, b.a, b.b)],
     ['POST', /^\/api\/ideas\/(\d+)\/judge$/, ([id]) => engine.judge(+id)],
@@ -299,13 +296,15 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
   function events(boardId: number, req: IncomingMessage, res: ServerResponse) {
     if (!repo.getBoard(boardId)) return send(res, 404, { error: 'Board not found' });
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+    streams.add(res);
     const write = (e: unknown) => res.write(`data: ${JSON.stringify(e)}\n\n`);
-    write({ type: 'hello', autopilot: autopilot.status(boardId), settingsReceived: runtime.received() });
+    write({ type: 'hello', autopilot: autopilot.status(boardId), ...usageStatus() });
     const off = engine.bus.on(boardId, write);
     const ping = setInterval(() => res.write(': ping\n\n'), 25_000);
     req.on('close', () => {
       off();
       clearInterval(ping);
+      streams.delete(res);
     });
   }
 
@@ -321,12 +320,24 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
     }
   }
 
-  return async function handler(req: IncomingMessage, res: ServerResponse) {
+  const handler = async function handler(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
+      const local = new URL(`http://${req.headers.host}`);
+      if (!['localhost', '127.0.0.1', '[::1]'].includes(local.hostname) || Number(local.port || 80) !== req.socket.localPort) {
+        throw new AppError(403, 'local_only', 'Use the local loopback address.');
+      }
+      const navigation = req.method === 'GET' && req.headers['sec-fetch-mode'] === 'navigate' &&
+        req.headers['sec-fetch-dest'] === 'document' && !url.pathname.startsWith('/api/');
+      if ((req.headers['sec-fetch-site'] === 'cross-site' && !navigation) || (req.headers.origin && req.headers.origin !== local.origin)) {
+        throw new AppError(403, 'bad_origin', 'Cross-origin access is not allowed.');
+      }
       if (!url.pathname.startsWith('/api/')) {
         if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed' });
         return await serveStatic(url.pathname, res);
+      }
+      if (['POST', 'PUT', 'PATCH'].includes(req.method ?? '') && req.headers['content-type']?.split(';')[0].trim() !== 'application/json') {
+        throw new AppError(415, 'json_required', 'Use application/json.');
       }
       const ev = url.pathname.match(/^\/api\/boards\/(\d+)\/events$/);
       if (ev && req.method === 'GET') return events(+ev[1], req, res);
@@ -340,9 +351,10 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
       }
       throw new AppError(404, 'not_found', `No route for ${req.method} ${url.pathname}`);
     } catch (e: any) {
-      const status = e instanceof AppError ? e.status : 500;
+      const status = e instanceof AppError ? e.status : e instanceof CopilotError ? 502 : 500;
       if (status >= 500) console.error(`[${req.method} ${url.pathname}]`, e?.message ?? e);
       send(res, status, { error: e?.message ?? 'Server error', code: e?.code ?? 'server_error' });
     }
   };
+  return Object.assign(handler, { closeStreams: () => { for (const stream of streams) stream.destroy(); } });
 }

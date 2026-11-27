@@ -1,21 +1,25 @@
 // The whole HTTP API against an in-memory database and a fake LLM.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer, type Server } from 'node:http';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { createServer, request, type Server } from 'node:http';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb } from '../server/db.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
 import { createHandler } from '../server/app.ts';
-import { DEFAULT_APP_SETTINGS, ProviderError, type AppSettings, type ChatRequest } from '../server/providers.ts';
+import { DEFAULT_APP_SETTINGS, CopilotError, type AppSettings, type ChatRequest } from '../server/copilot.ts';
 
 const calls: ChatRequest[] = [];
 let judgeScores = { originality: 3, feasibility: 3, impact: 3 };
 let judgeKeywords = ['Public Space', 'sound'];
 let failNext: Error | null = null;
-let xCitations: string[] = [];
+let xSearchLookups = 0;
+let xResults = [
+  { id: '1', url: 'https://x.com/a/status/1', title: 'Source A', snippet: 'First indexed source snippet', retrievedAt: '2026-11-12', query: 'site:x.com sound', indexAge: '1 day ago' },
+  { id: '2', url: 'https://twitter.com/b/status/2', title: 'Source B', snippet: 'Second indexed source snippet', retrievedAt: '2026-11-12', query: 'site:x.com sound', indexAge: '' },
+];
 
 // Fake chat: answers by schema name, records every request.
 async function fakeChat(r: ChatRequest) {
@@ -32,22 +36,27 @@ async function fakeChat(r: ChatRequest) {
     : r.schemaName === 'summary' ? { headline: 'Tavlan rör sig mot ljud.', themes: [{ name: 'Ljud', insight: 'Allt låter.', ideas: ['Lånecyklar'] }], strongest: [{ title: 'Korsning', why: 'Konkret.' }], gaps: ['Ingen tänker på natten.'], nextSteps: ['Korsa A och B.'] }
     : r.schemaName === 'synthesis' ? { headline: 'Bänkarna dominerar.', insights: ['i1', 'i2', 'i3'], standouts: [{ title: 'Sjungande parkbänk', board: 'X', why: 'w' }], opportunities: ['o1', 'o2'], nextSteps: ['n1', 'n2'] }
     : r.schemaName === 'brief' ? { name: 'Sjungande bänk', slug: 'Sjungande Bänk!', oneLiner: 'En bänk som sjunger.', problem: 'P', audience: 'A', mvp: ['m1', 'm2'], outOfScope: ['o'], stack: 's', firstSteps: ['f1', 'f2'], openQuestions: ['q1'], risks: ['r1'] }
+    : r.schemaName === 'document_ideas' ? { ideas: [
+        { title: 'Replay receipts', pitch: 'Devices exchange replay receipts to avoid retransmitting accepted work.', evidence: 'Devices exchange replay receipts.' },
+        { title: 'Thermal routing', pitch: 'A router sends work to cool nodes so the fleet can avoid throttling.', evidence: 'The router directs work to cool nodes.' },
+      ] }
     : r.schemaName === 'leads' ? { leads: [
-        { title: 'Trend A', summary: 'S', hook: 'H', url: 'https://x.com/a/status/1' },
-        { title: 'Trend B', summary: 'S', hook: 'H', url: 'https://twitter.com/b/status/2?s=20' },
-        { title: 'Made up', summary: 'S', hook: 'H', url: 'https://x.com/fake/status/3' },
+        { title: 'Trend A', summary: 'S', hook: 'H', id: '1' },
+        { title: 'Trend B', summary: 'S', hook: 'H', id: '2' },
+        { title: 'Made up', summary: 'S', hook: 'H', id: '3' },
       ] }
     : r.schemaName === 'research' ? { leads: [
         { id: '2610.1', title: 'Rumsljud', summary: 'S', hook: 'H' },
         { id: '9999.9', title: 'Påhittad', summary: 'S', hook: 'H' },
       ] }
     : { title: r.schemaName === 'seed' ? 'Destillerat frö' : 'Korsning', pitch: 'En kombinerad pitch.' };
-  return { value, costUsd: 0.001, citations: r.schemaName === 'leads' ? xCitations : [] };
+  return { value };
 }
 
 const projectsRoot = mkdtempSync(join(tmpdir(), 'ideagen-projects-'));
 let settings: AppSettings = { ...structuredClone(DEFAULT_APP_SETTINGS), projectsRoot };
 let received = false;
+let xSearchConfigured = false;
 const runtime = { get: () => settings, set: (s: AppSettings) => { settings = s; received = true; }, received: () => received };
 
 const repo = openDb(':memory:');
@@ -66,18 +75,33 @@ const engine = createEngine({
     { id: '2610.1', title: 'Spatial audio', summary: 'sum', published: '2026-10-30', upvotes: 9 },
     { id: '2610.2', title: 'Other', summary: 'sum', published: '2026-10-29', upvotes: 1 },
   ],
+  fetchXSearchResults: async () => { xSearchLookups++; return xResults; },
   reveal: (p) => revealed.push(p),
 });
 const autopilot = createAutopilot({ repo, engine, settings: () => settings });
 let server: Server;
+let handler: ReturnType<typeof createHandler>;
 let base = '';
 
 before(async () => {
-  server = createServer(createHandler({ repo, engine, autopilot, runtime, publicDir: join(import.meta.dirname, '..', 'public') }));
+  handler = createHandler({
+    repo, engine, autopilot, runtime,
+    xSearchConfigured: () => xSearchConfigured,
+    copilot: { status: async () => ({ isAuthenticated: true, login: 'test-user' }), models: async () => ['gpt-6.1-sol'] },
+    publicDir: join(import.meta.dirname, '..', 'public'),
+  });
+  server = createServer(handler);
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   base = `http://127.0.0.1:${(server.address() as any).port}`;
 });
-after(() => server.close());
+after(async () => {
+  await autopilot.stop();
+  await engine.idle();
+  handler.closeStreams();
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  repo.close();
+  rmSync(projectsRoot, { recursive: true });
+});
 
 async function api(method: string, path: string, body?: unknown) {
   const res = await fetch(base + path, {
@@ -91,6 +115,31 @@ async function api(method: string, path: string, body?: unknown) {
 const newBoard = async (extra: object = {}) => (await api('POST', '/api/boards', { lang: 'sv', ...extra })).data.board;
 const seed = async (boardId: number, text: string) => (await api('POST', `/api/boards/${boardId}/seed`, { text })).data.idea;
 const lastCall = (schema: string) => [...calls].reverse().find((c) => c.schemaName === schema)!;
+
+test('document HTTP flow publishes multiple ordinary seeds, replays safely, and supports normal connections', async () => {
+  const board = await newBoard();
+  await api('PATCH', `/api/boards/${board.id}`, { config: { autoProjectOnGold: false } });
+  const text = 'Devices exchange replay receipts.\nThe router directs work to cool nodes.';
+  const { status, data } = await api('POST', `/api/boards/${board.id}/documents`, { text, requestId: 'paste-test' });
+  assert.equal(status, 200);
+  assert.equal(data.ideas.length, 2);
+  assert.ok(data.ideas.every((idea: { kind: string; generation: number }) => idea.kind === 'seed' && idea.generation === 0));
+  await engine.idle();
+  const before = calls.length;
+  const replay = await api('POST', `/api/boards/${board.id}/documents`, { text });
+  assert.equal(replay.data.reused, true);
+  assert.deepEqual(replay.data.ideas.map((idea: { id: number }) => idea.id), data.ideas.map((idea: { id: number }) => idea.id));
+  assert.equal(calls.length, before, 'a completed retry makes no AI calls');
+  const combined = await api('POST', `/api/boards/${board.id}/combine`, { a: data.ideas[0].id, b: data.ideas[1].id });
+  assert.equal(combined.status, 200);
+  assert.equal(combined.data.edges.length, 2);
+  const wall = await api('GET', `/api/boards/${board.id}`);
+  assert.equal(wall.data.ideas.length, 3);
+  assert.ok(wall.data.ideas.filter((idea: { kind: string }) => idea.kind === 'seed').every((idea: { judgedAt: string }) => idea.judgedAt));
+  assert.equal((await api('POST', `/api/boards/${board.id}/documents`, { text: '' })).status, 400);
+  assert.equal((await api('POST', `/api/boards/${board.id}/documents`, { text: 'a'.repeat(100_001) })).status, 413);
+  await engine.idle();
+});
 
 test('full loop: seed → background judge → expand → combine → export', async () => {
   judgeScores = { originality: 3, feasibility: 3, impact: 3 };
@@ -130,29 +179,29 @@ test('full loop: seed → background judge → expand → combine → export', a
   assert.match(md, /> Färre bilresor i staden/);
   assert.match(md, /## 🥉 Korsning — 10\/15/, '10/15 is bronze');
   assert.match(md, /`public space` `sound`/);
-  assert.ok(repo.spentOn(board.id) > 0, 'spend lands on the board');
+  assert.ok(repo.requestsOn(board.id) > 0, 'requests land on the board');
+  assert.equal(repo.spentOn(board.id), 0, 'Copilot requests do not create fake dollar spend');
   judgeScores = { originality: 3, feasibility: 3, impact: 3 };
 });
 
 test('each role uses its own model: app-wide setting, overridden per board', async () => {
   const pushed = await api('PUT', '/api/runtime-settings', {
-    ...settings, models: { ...settings.models, expand: 'ollama:qwen3:8b' }, keys: { openrouter: 'sk-or-secret-123' },
+    ...settings, models: { ...settings.models, expand: 'gpt-test-expand' }, keys: { openrouter: 'legacy-secret-123' },
   });
-  assert.ok(!JSON.stringify(pushed.data).includes('sk-or-secret-123'), 'keys are never echoed back');
-  assert.equal(pushed.data.providers.find((p: any) => p.id === 'openrouter').keySource, 'browser');
+  assert.ok(!JSON.stringify(settings).includes('legacy-secret-123'), 'legacy secrets are never retained');
   assert.equal(pushed.data.settingsReceived, true);
 
   const board = await newBoard();
   const s = await seed(board.id, 'Rot');
   await api('POST', `/api/ideas/${s.id}/expand`, {});
-  assert.equal(lastCall('expand').model, 'ollama:qwen3:8b');
+  assert.equal(lastCall('expand').model, 'gpt-test-expand');
 
-  await api('PATCH', `/api/boards/${board.id}`, { config: { models: { expand: 'anthropic:claude-opus-5-5' } } });
+  await api('PATCH', `/api/boards/${board.id}`, { config: { models: { expand: 'gpt-test-board' } } });
   await api('POST', `/api/ideas/${s.id}/expand`, {});
-  assert.equal(lastCall('expand').model, 'anthropic:claude-opus-5-5', 'board override wins');
+  assert.equal(lastCall('expand').model, 'gpt-test-board', 'board override wins');
   await api('PATCH', `/api/boards/${board.id}`, { config: { models: { expand: '' } } });
   await api('POST', `/api/ideas/${s.id}/expand`, {});
-  assert.equal(lastCall('expand').model, 'ollama:qwen3:8b', 'an empty override falls back to the app setting');
+  assert.equal(lastCall('expand').model, 'gpt-test-expand', 'an empty override falls back to the app setting');
   await engine.idle();
   settings = { ...structuredClone(DEFAULT_APP_SETTINGS), projectsRoot };
 });
@@ -160,18 +209,18 @@ test('each role uses its own model: app-wide setting, overridden per board', asy
 test('board config is validated and clamped', async () => {
   const board = await newBoard();
   const { data } = await api('PATCH', `/api/boards/${board.id}`, {
-    config: { mode: 'chaos', rate: { stepsPerHour: 0, usdPerDay: -3 }, autopilotSeconds: 1, flow: { system: '' }, lang: 'de' },
+    config: { mode: 'chaos', rate: { stepsPerHour: 0, requestsPerDay: -3 }, autopilotSeconds: 1, flow: { system: '' }, lang: 'de' },
   });
   const c = data.board.config;
   assert.equal(c.mode, 'manual');
   assert.equal(c.rate.stepsPerHour, 1);
-  assert.equal(c.rate.usdPerDay, 0);
+  assert.equal(c.rate.requestsPerDay, 0);
   assert.equal(c.autopilotSeconds, 3);
   assert.ok(c.flow.system.length > 20, 'an empty prompt keeps the old one');
   assert.equal(c.lang, 'sv');
 });
 
-test('the judge turns gold into a Claude Code project; a board can switch that off', async () => {
+test('the judge turns gold into a Copilot project; a board can switch that off', async () => {
   judgeScores = { originality: 5, feasibility: 4, impact: 5 };
   const board = await newBoard({ goal: 'Ljud i offentliga rum' });
   const s = await seed(board.id, 'Sjungande parkbänk');
@@ -180,10 +229,10 @@ test('the judge turns gold into a Claude Code project; a board can switch that o
   assert.ok(gold.projectPath, 'gold → project');
   assert.ok(gold.projectPath!.startsWith(projectsRoot));
   assert.match(gold.projectPath!, /sjungande-bank$/, 'slug is ASCII');
-  const claude = readFileSync(join(gold.projectPath!, 'CLAUDE.md'), 'utf8');
-  assert.match(claude, /^# Sjungande bänk/);
-  assert.match(claude, /Ljud i offentliga rum/);
-  assert.match(claude, /14\/15 🥇/);
+  const instructions = readFileSync(join(gold.projectPath!, 'AGENTS.md'), 'utf8');
+  assert.match(instructions, /^# Sjungande bänk/);
+  assert.match(instructions, /Ljud i offentliga rum/);
+  assert.match(instructions, /14\/15 🥇/);
   assert.ok(existsSync(join(gold.projectPath!, 'vault', 'Home.md')));
   assert.match(readFileSync(join(gold.projectPath!, '.gitignore'), 'utf8'), /^vault\/$/m);
 
@@ -246,14 +295,17 @@ test('spin-off: a new board grown from one idea, refined in its own context', as
   await engine.idle();
 });
 
-test('leads: X keeps only search-cited posts; research keeps only real paper ids', async () => {
+test('leads: indexed X snippets and research keep only retrieved source IDs and provenance', async () => {
   const board = await newBoard({ goal: 'Interaktivt ljus' });
-  xCitations = ['https://x.com/a/status/1', 'https://x.com/b/status/2'];
   const { data: x } = await api('POST', `/api/boards/${board.id}/leads/x`, {});
   assert.deepEqual(x.leads.map((l: any) => l.title), ['Trend A', 'Trend B']);
-  assert.equal(x.dropped, 1, 'the uncited post is dropped');
-  assert.deepEqual(lastCall('leads').plugins, [{ id: 'web', engine: 'native', max_results: 12 }]);
-  assert.equal(lastCall('leads').model, 'openrouter:x-ai/grok-4.3');
+  assert.equal(x.dropped, 1, 'the invented source ID is dropped');
+  assert.equal(lastCall('leads').model, DEFAULT_APP_SETTINGS.models.x);
+  assert.match(lastCall('leads').user, /First indexed source snippet/);
+  assert.match(lastCall('leads').user, /NOT verified live posts/);
+  assert.equal(x.leads[0].meta.discovery, 'brave');
+  assert.equal(x.leads[0].meta.evidence, 'indexed-snippet');
+  assert.equal(x.leads[0].meta.retrievedAt, '2026-11-12');
 
   const { data: r } = await api('POST', `/api/boards/${board.id}/leads/research`, {});
   assert.deepEqual(r.leads.map((l: any) => l.url), ['https://huggingface.co/papers/2610.1']);
@@ -263,10 +315,12 @@ test('leads: X keeps only search-cited posts; research keeps only real paper ids
   assert.equal(s.idea.sourceUrl, 'https://x.com/a/status/1');
   assert.equal(s.lead.ideaId, s.idea.id);
 
-  xCitations = [];
+  xResults = [];
+  const before = repo.requestsOn(board.id);
   const { data: x2 } = await api('POST', `/api/boards/${board.id}/leads/x`, {});
   assert.equal(x2.empty, true);
   assert.equal(x2.leads.length, 2, 'nothing verified: old leads stay');
+  assert.equal(repo.requestsOn(board.id), before, 'empty non-AI retrieval consumes no Copilot request');
   await engine.idle();
 });
 
@@ -326,21 +380,23 @@ test('live events: a browser following a board sees what happens', async () => {
   await seed(board.id, 'Live');
   await engine.idle();
   await new Promise((r) => setTimeout(r, 50));
-  ctrl.abort();
+  handler.closeStreams();
   await pump;
   const types = seen.map((e) => e.type);
   assert.equal(types[0], 'hello');
+  assert.deepEqual(seen[0].sources, { x: { configured: false } }, 'reconnecting browsers receive current server configuration');
   assert.ok(types.includes('ideas') && types.includes('judging'), types.join(','));
+  assert.ok(seen.some((e) => e.type === 'usage' && e.requestsToday === 1), 'manual/background requests update the usage display');
 });
 
-test('provider failures surface with their code, and nothing is half-saved', async () => {
+test('Copilot failures surface with their code, and nothing is half-saved', async () => {
   const board = await newBoard();
   const s = await seed(board.id, 'Frö');
   await engine.idle();
-  failNext = new ProviderError('no_key', 'OpenRouter: no API key');
+  failNext = new CopilotError('copilot_auth', 'Copilot sign-in expired; run copilot login');
   const r = await api('POST', `/api/ideas/${s.id}/expand`, {});
   assert.equal(r.status, 502);
-  assert.equal(r.data.code, 'no_key');
+  assert.equal(r.data.code, 'copilot_auth');
   assert.equal(repo.listIdeas(board.id).length, 1);
 });
 
@@ -374,6 +430,56 @@ test('static files, path traversal, unknown routes', async () => {
   assert.equal((await api('GET', '/api/nope')).status, 404);
 });
 
+test('local Copilot identity cannot be used by a cross-origin page or DNS-rebinding host', async () => {
+  const before = calls.length;
+  const crossOrigin = await fetch(base + '/api/report/synthesis', {
+    method: 'POST', headers: { Origin: 'https://untrusted.example', 'Content-Type': 'application/json' }, body: '{}',
+  });
+
+  assert.equal(crossOrigin.status, 403);
+  const form = await fetch(base + '/api/runtime-settings', { method: 'PUT', headers: { 'Content-Type': 'text/plain' }, body: '{}' });
+  assert.equal(form.status, 415);
+  const rebound = await new Promise<number | undefined>((resolve, reject) => {
+    const req = request(base + '/api/copilot/status', { headers: { Host: 'untrusted.example' } }, (res) => { res.resume(); resolve(res.statusCode); });
+    req.on('error', reject);
+    req.end();
+  });
+  assert.equal(rebound, 403);
+  const navigation = await new Promise<number | undefined>((resolve, reject) => {
+    const req = request(base + '/', { headers: { 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document' } }, (res) => { res.resume(); resolve(res.statusCode); });
+    req.on('error', reject);
+    req.end();
+  });
+  assert.equal(navigation, 200, 'opening the app from an external link must still work');
+  assert.equal(calls.length, before);
+  assert.deepEqual((await api('GET', '/api/copilot/models')).data.models, ['gpt-6.1-sol']);
+});
+
+test('Brave setup status reports only this server’s key presence, without a search or AI request', async () => {
+  const before = calls.length;
+  const lookupsBefore = xSearchLookups;
+  try {
+    xSearchConfigured = true;
+    const configured = await api('GET', '/api/runtime-settings');
+    assert.deepEqual(configured.data.sources, { x: { configured: true } });
+    assert.deepEqual((await api('GET', '/api/copilot/status')).data.sources, { x: { configured: true } });
+    xSearchConfigured = false;
+    assert.deepEqual((await api('GET', '/api/runtime-settings')).data.sources, { x: { configured: false } });
+    assert.equal(calls.length, before, 'checking configuration must not submit an AI request');
+    assert.equal(xSearchLookups, lookupsBefore, 'checking configuration must not call Brave');
+  } finally { xSearchConfigured = false; }
+});
+
+test('new settings reject invalid request limits and external model routing without saving', async () => {
+  const original = structuredClone(settings);
+  for (const limit of [-1, 1.5, 100_001]) {
+    assert.equal((await api('PUT', '/api/runtime-settings', { ...settings, maxRequestsPerDay: limit })).status, 400);
+  }
+  const badModel = await api('PUT', '/api/runtime-settings', { ...settings, models: { ...settings.models, judge: 'ollama:local' } });
+  assert.equal(badModel.data.code, 'bad_model');
+  assert.deepEqual(settings, original);
+});
+
 test('report: totals, every project, per-board insights, saved conclusions, Markdown', async () => {
   const { data: before } = await api('GET', '/api/report?days=30');
   assert.ok(before.totals.ideas > 0 && before.totals.boards > 0);
@@ -387,7 +493,7 @@ test('report: totals, every project, per-board insights, saved conclusions, Mark
   const { data: after } = await api('POST', '/api/report/synthesis', { days: 30, lang: 'sv' });
   const call = calls.filter(synthCall).at(-1)!;
   assert.match(call.user, /Sjungande parkbänk/, 'the synthesis sees the boards’ best ideas');
-  assert.match(call.user, /Claude Code projects:/);
+  assert.match(call.user, /GitHub Copilot projects:/);
   assert.equal(call.model, DEFAULT_APP_SETTINGS.models.summary);
   assert.equal(typeof after.synthesis.headline, 'string');
   assert.equal(after.synthesis.days, 30);
@@ -395,5 +501,5 @@ test('report: totals, every project, per-board insights, saved conclusions, Mark
   const { data: md } = await api('GET', '/api/report.md?days=30&lang=sv');
   assert.match(md, /^# Rapport · \d{4}-\d{2}-\d{2}/);
   assert.match(md, /## Slutsatser/);
-  assert.match(md, /cd ".*sjungande-bank" && claude/);
+  assert.match(md, /cd ".*sjungande-bank" && copilot/);
 });
